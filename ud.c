@@ -38,7 +38,7 @@
     fprintf(stderr, "%s returned %d errno %d\n", verb, ret, errno)
 /* Default parameter values */
 #define DEFAULT_PORT "51216"
-#define DEFAULT_MSG_COUNT 6
+#define DEFAULT_MSG_COUNT 10000
 #define DEFAULT_MSG_LENGTH 64
 /* Resources used in the example */
 struct context
@@ -57,7 +57,8 @@ struct context
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_mr *mr;
-    char *buf;
+    long buf;
+    char *recv_buf;
     struct ibv_ah *ah;
     uint32_t remote_qpn;
     uint32_t remote_qkey;
@@ -247,7 +248,7 @@ int create_resources(struct context *ctx)
             return ret;
         }
     }
-    ctx->cq = ibv_create_cq(ctx->id->verbs, 2, 0, 0, 0);
+    ctx->cq = ibv_create_cq(ctx->id->verbs, 10000, 0, 0, 0);
     if (!ctx->cq)
     {
         VERB_ERR("ibv_create_cq", -1);
@@ -269,12 +270,18 @@ int create_resources(struct context *ctx)
     /* The receiver must allow enough space in the receive buffer for
  * the GRH */
 
-    // buf_size = ctx->msg_length + (ctx->sender ? 0 : sizeof(struct ibv_grh));
-    buf_size = ctx->msg_length + sizeof(struct ibv_grh);
-    ctx->buf = calloc(1, buf_size);
-    memset(ctx->buf, 0x00, buf_size);
+    buf_size = ctx->msg_length + (ctx->sender ? 0 : sizeof(struct ibv_grh));
+    // buf_size = ctx->msg_length + sizeof(struct ibv_grh);
+    ctx->recv_buf = calloc(1, buf_size);
+    memset(ctx->recv_buf, 0x00, buf_size);
     /* Register our memory region */
-    ctx->mr = rdma_reg_msgs(ctx->id, ctx->buf, buf_size);
+    if(ctx->sender){
+        ctx->mr = rdma_reg_msgs(ctx->id, (void *)&ctx->buf, buf_size);
+    }
+    else{
+        ctx->mr = rdma_reg_msgs(ctx->id, ctx->recv_buf, buf_size);
+    }
+
     if (!ctx->mr)
     {
         VERB_ERR("rdma_reg_msgs", -1);
@@ -307,8 +314,8 @@ void destroy_resources(struct context *ctx)
         ibv_destroy_cq(ctx->cq);
     if (ctx->mr)
         rdma_dereg_mr(ctx->mr);
-    if (ctx->buf)
-        free(ctx->buf);
+    if (ctx->recv_buf)
+        free(ctx->recv_buf);
     if (ctx->pd && ctx->id->pd == NULL)
         ibv_dealloc_pd(ctx->pd);
     rdma_destroy_id(ctx->id);
@@ -328,15 +335,15 @@ void destroy_resources(struct context *ctx)
  * Description:
  * Posts a UD send to the multicast address
  */
-int post_send(struct context *ctx)
+int post_send(struct context *ctx, int i)
 {
     int ret;
     struct ibv_send_wr wr, *bad_wr;
     struct ibv_sge sge;
-    memset(ctx->buf, 0x12, ctx->msg_length); /* set the data to non-zero */
+    ctx->buf = (long)i; /* set the data to non-zero */
     sge.length = ctx->msg_length;
     sge.lkey = ctx->mr->lkey;
-    sge.addr = (uint64_t)ctx->buf;
+    sge.addr = (uint64_t)&ctx->buf;
     /* Multicast requires that the message is sent with immediate data
     * and that the QP number is the contents of the immediate data */
     wr.next = NULL;
@@ -386,7 +393,12 @@ int get_completion(struct context *ctx)
             return -1;
         }
     } while (ret == 0);
-    printf("event come opcode %d\n", wc.opcode);
+    if(ctx->sender){
+        printf("event come opcode %d num %ld ret %d cq_cap %d\n", wc.opcode, ctx->buf, ret, ctx->cq->cqe);
+    }else{
+        printf("event come opcode %d ret %d num %ld cq_cap %d\n", wc.opcode , ret, ((long *)(ctx->recv_buf))[5], ctx->cq->cqe);// 
+    }
+
     if (wc.status != IBV_WC_SUCCESS)
     {
         printf("work completion status %s\n",
@@ -491,6 +503,7 @@ int main(int argc, char **argv)
         VERB_ERR("ibv_query_port", ret);
         goto out;
     }
+    printf("MTU %d xxx %d \n", port_attr.active_mtu, (1 << port_attr.active_mtu + 7));
     if (ctx.msg_length > (1 << port_attr.active_mtu + 7))
     {
         printf("buffer length %d is larger then active mtu %d\n",
@@ -500,17 +513,20 @@ int main(int argc, char **argv)
     ret = create_resources(&ctx);
     if (ret)
         goto out;
-    for (i = 0; i < ctx.msg_count+1; i++)
+    for (i = 0; i < 10000; i++)//((ctx.msg_count>10000) ? 10000 : ctx.msg_count)
     {
-        ret = rdma_post_recv(ctx.id, NULL, ctx.buf,
-                             ctx.msg_length + sizeof(struct ibv_grh),
-                             ctx.mr);
-        if (ret)
-        {
-            VERB_ERR("rdma_post_recv", ret);     
-            goto out;
+        if(!ctx.sender){
+            ret = rdma_post_recv(ctx.id, NULL, ctx.recv_buf,
+                                ctx.msg_length + sizeof(struct ibv_grh),
+                                ctx.mr);
+            if (ret)
+            {
+                VERB_ERR("rdma_post_recv", ret);     
+                goto out;
+            }
         }
     }
+
     /* Join the multicast group */
     ret = rdma_join_multicast(ctx.id, &ctx.mcast_sockaddr, NULL);
     if (ret)
@@ -518,10 +534,16 @@ int main(int argc, char **argv)
         VERB_ERR("rdma_join_multicast", ret);
         goto out;
     }
+
+    if(ctx.sender){
+        sleep(1);
+    }
+
     /* Verify that we successfully joined the multicast group */
     ret = get_cm_event(ctx.channel, RDMA_CM_EVENT_MULTICAST_JOIN, &event);
     if (ret)
         goto out;
+    
     inet_ntop(AF_INET6, event->param.ud.ah_attr.grh.dgid.raw, buf, 40);
     printf("joined dgid: %s, mlid 0x%x, sl %d\n", buf,
            event->param.ud.ah_attr.dlid, event->param.ud.ah_attr.sl);
@@ -544,12 +566,23 @@ int main(int argc, char **argv)
     pthread_create(&ctx.cm_thread, NULL, cm_thread, &ctx);
     if (!ctx.sender)
         printf("waiting for messages...\n");
-    sleep(2);
+    else {
+        // post_send(&ctx, 0);
+        // sleep(1);
+        printf("Ready");
+    }
+    
     for (i = 0; i < ctx.msg_count; i++)
     {
+        // if (i < 1){
+        //     if (ctx.sender){
+        //         sleep(2);
+        //     }
+        // }
+        
         if (ctx.sender)
         {
-            ret = post_send(&ctx);
+            ret = post_send(&ctx, i + 1);
             if (ret)
                 goto out;
         }
@@ -561,10 +594,24 @@ int main(int argc, char **argv)
         else
             printf("received message %d\n", i + 1);
 
-        sleep(1);
+        // if(!ctx.sender){
+        //     ret = rdma_post_recv(ctx.id, NULL, ctx.recv_buf,
+        //                         ctx.msg_length + sizeof(struct ibv_grh),
+        //                         ctx.mr);
+        //     if (ret)
+        //     {
+        //         VERB_ERR("rdma_post_recv", ret);     
+        //         goto out;
+        //     }
+        // }
+        // if(i>=4)sleep(1);
     }
-    while(1)
-        get_completion(&ctx);
+    // get_completion(&ctx);
+    // get_completion(&ctx);
+    // get_completion(&ctx);
+    // get_completion(&ctx);
+    // get_completion(&ctx);
+    // get_completion(&ctx);
     
 out:
     ret = rdma_leave_multicast(ctx.id, &ctx.mcast_sockaddr);
